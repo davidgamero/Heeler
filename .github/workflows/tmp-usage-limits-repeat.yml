@@ -1,0 +1,227 @@
+# Temporary investigation for #607. Lives only on tmp/usage-limits-repeat-607.
+#
+# Repeats AgentUsageLimitsTests on the hosted macos-26 runner, where the
+# failure was seen: once on its own, and inside fresh full app lanes that
+# mirror full verification's ordinary shard (no fixtures, scheme defaults).
+
+name: Temporary Usage Limits repetition (#607)
+
+on:
+  push:
+    branches: [tmp/usage-limits-repeat-607]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-usage-limits-repeat-607
+  cancel-in-progress: true
+
+jobs:
+  repeat:
+    name: Repeat (${{ matrix.mode }})
+    runs-on: macos-26
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [suite-serial, full-lane-1, full-lane-2, full-lane-3]
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      MODE: ${{ matrix.mode }}
+      SUITE_ITERATIONS: '100'
+      FULL_LANE_RUNS: '4'
+      # Matches the ordinary shard: the gate is on, no fixture is configured.
+      HEELER_SSH_E2E_REQUIRED: '0'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Restore SwiftPM checkouts
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .ci/source-packages
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('Heeler.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      - name: Show toolchain and pick the Simulator
+        id: simulator
+        run: |
+          xcodebuild -version
+          python3 - > "$RUNNER_TEMP/simulator.txt" <<'PY'
+          import json, subprocess, sys
+          runtimes = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "runtimes", "--json"]))["runtimes"]
+          devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "--json"]))["devices"]
+          best = None
+          for runtime in runtimes:
+              if not runtime["isAvailable"] or runtime.get("platform") != "iOS":
+                  continue
+              version = tuple(int(part) for part in runtime["version"].split("."))
+              for device in devices.get(runtime["identifier"], []):
+                  if device["name"] == "iPhone 17" and (best is None or version > best[0]):
+                      best = (version, device["udid"], runtime["version"])
+          if best is None:
+              sys.exit("No available iPhone 17 Simulator")
+          print(f"Selected iPhone 17 on iOS {best[2]}: {best[1]}", file=sys.stderr)
+          print(f"udid={best[1]}")
+          print(f"os={best[2]}")
+          PY
+          cat "$RUNNER_TEMP/simulator.txt" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$(sed -n 's/^udid=//p' "$RUNNER_TEMP/simulator.txt")" || true
+
+      - name: Compute compilation cache key
+        id: cache-key
+        run: scripts/ci-compilation-cache-prefix.sh ios-fast-cas-v1
+
+      # Restore only: this investigation must not write shared caches.
+      - name: Restore compilation cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci/app-compilation-cache
+          key: ${{ steps.cache-key.outputs.cache-prefix }}${{ github.sha }}
+          restore-keys: |
+            ${{ steps.cache-key.outputs.cache-prefix }}
+
+      - name: Build app and tests
+        timeout-minutes: 40
+        run: make build-ci-app > "$RUNNER_TEMP/build.log" 2>&1 || { tail -200 "$RUNNER_TEMP/build.log"; exit 1; }
+
+      - name: Repeat AgentUsageLimitsTests
+        timeout-minutes: 75
+        env:
+          UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          set -uo pipefail
+          results="$RUNNER_TEMP/usage-results"
+          mkdir -p "$results"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl spawn "$UDID" launchctl setenv HEELER_SSH_E2E_REQUIRED 0
+          common=(test-without-building -disableAutomaticPackageResolution
+            -project Heeler.xcodeproj -scheme Heeler
+            -derivedDataPath "$GITHUB_WORKSPACE/.ci/app-derived"
+            -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.ci/source-packages"
+            -destination "platform=iOS Simulator,id=$UDID"
+            -collect-test-diagnostics never)
+          case "$MODE" in
+            suite-serial)
+              started=$SECONDS
+              python3 scripts/run-app-simulator-tests.py "${common[@]}" \
+                -resultBundlePath "$results/suite.xcresult" \
+                -parallel-testing-enabled NO -test-iterations "$SUITE_ITERATIONS" \
+                -only-testing:HeelerTests/AgentUsageLimitsTests \
+                > "$results/suite.log" 2>&1
+              echo "suite: status $? after $((SECONDS - started))s"
+              ;;
+            full-lane-*)
+              for run in $(seq 1 "$FULL_LANE_RUNS"); do
+                started=$SECONDS
+                python3 scripts/run-app-simulator-tests.py "${common[@]}" \
+                  -resultBundlePath "$results/full-$run.xcresult" \
+                  > "$results/full-$run.log" 2>&1
+                echo "full lane $run: status $? after $((SECONDS - started))s"
+              done
+              ;;
+          esac
+          exit 0
+
+      - name: Report results
+        if: ${{ !cancelled() }}
+        env:
+          SIMULATOR_OS: ${{ steps.simulator.outputs.os }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+
+          TARGET = "AgentUsageLimitsTests"
+          RUN_NODES = {"Repetition", "Arguments", "Device", "Test Plan Configuration", "Test Case Run"}
+          EXECUTED = {"Passed", "Failed", "Expected Failure"}
+          mode = os.environ["MODE"]
+          results = pathlib.Path(os.environ["RUNNER_TEMP"]) / "usage-results"
+          expected = 1 if mode == "suite-serial" else int(os.environ["FULL_LANE_RUNS"])
+
+
+          def report(bundle, kind):
+              return json.loads(subprocess.check_output([
+                  "xcrun", "xcresulttool", "get", "test-results", kind, "--path", str(bundle), "--compact"]))
+
+
+          def outcomes(node):
+              runs = [child for child in node.get("children", []) if child.get("nodeType") in RUN_NODES]
+              if not runs:
+                  return [node.get("result")]
+              return [result for child in runs for result in outcomes(child)]
+
+
+          def analyze(tests):
+              failed, target_runs, target_failures = set(), 0, 0
+              stack = [(node, False) for node in tests.get("testNodes", [])]
+              while stack:
+                  node, in_target = stack.pop()
+                  identifier = node.get("nodeIdentifier") or node.get("name") or ""
+                  in_target = in_target or TARGET in identifier
+                  if node.get("nodeType") == "Test Case":
+                      results_ = outcomes(node)
+                      if in_target:
+                          target_runs += sum(result in EXECUTED for result in results_)
+                          target_failures += results_.count("Failed")
+                      if "Failed" in results_:
+                          failed.add(identifier)
+                      continue
+                  stack.extend((child, in_target) for child in node.get("children", []))
+              return failed, target_runs, target_failures
+
+
+          lines = [
+              f"### {mode}: iPhone 17 iOS {os.environ['SIMULATOR_OS']}, image {os.environ.get('ImageVersion', 'unknown')}",
+              "",
+              "| Bundle | Executed | Failed | Skipped | Usage Limits runs | Usage Limits failures | Failed tests |",
+              "| --- | --- | --- | --- | --- | --- | --- |",
+          ]
+          bundles = sorted(results.glob("*.xcresult"))
+          problem = len(bundles) != expected
+          if problem:
+              lines.append(f"Expected {expected} result bundles, found {len(bundles)}.")
+          for bundle in bundles:
+              try:
+                  summary, tests = report(bundle, "summary"), report(bundle, "tests")
+              except (subprocess.CalledProcessError, ValueError) as error:
+                  problem = True
+                  lines.append(f"| {bundle.name} | unreadable | | | | | {error} |")
+                  continue
+              failed, target_runs, target_failures = analyze(tests)
+              executed = summary["totalTestCount"] - summary["skippedTests"]
+              problem |= bool(summary["failedTests"] or failed or target_failures or not target_runs)
+              lines.append(
+                  f"| {bundle.name} | {executed} | {summary['failedTests']} | {summary['skippedTests']} "
+                  f"| {target_runs} | {target_failures} | {', '.join(sorted(failed)) or '-'} |")
+          text = "\n".join(lines) + "\n"
+          print(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+              handle.write(text)
+          sys.exit(1 if problem else 0)
+          PY
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: usage-limits-${{ matrix.mode }}-logs-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/usage-results/*.log
+            ${{ runner.temp }}/build.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload result bundles after a failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: usage-limits-${{ matrix.mode }}-xcresult-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/usage-results/*.xcresult
+          if-no-files-found: warn
+          retention-days: 7
