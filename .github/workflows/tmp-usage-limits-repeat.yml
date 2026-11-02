@@ -25,7 +25,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [suite-serial, full-lane-1, full-lane-2, full-lane-3]
+        # suite-serial finished in run 41435375077 (1100 passed); repeat full lanes only.
+        mode: [full-lane-1, full-lane-2, full-lane-3]
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       MODE: ${{ matrix.mode }}
@@ -96,7 +97,8 @@ jobs:
         env:
           UDID: ${{ steps.simulator.outputs.udid }}
         run: |
-          set -uo pipefail
+          # The default shell runs with -e; a failing run must not stop the loop.
+          set +e -u
           results="$RUNNER_TEMP/usage-results"
           mkdir -p "$results"
           xcrun simctl bootstatus "$UDID" -b
