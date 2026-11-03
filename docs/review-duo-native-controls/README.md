@@ -3,6 +3,7 @@
 Deterministic `--demo-screenshots` captures for candidate `34ed1325`, built with Xcode 27.2 and run on iOS 27.2.
 
 - `outer-chat.png`: folded Duo, native Back, code-bubble and overflow controls
+- `before-pr610.png`: folded Duo after PR 610, with surface and More still floating
 - `inner-landscape.png`: unfolded landscape, sidebar plus native detail controls
 - `inner-portrait.png`: unfolded portrait horizontal fallback
 - `outer-shell.png`: folded Duo Shell Terminal with native Back and overflow
